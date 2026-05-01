@@ -36,7 +36,7 @@
 
 namespace disco_kernels {
 
-template <int BDIM_X, int ELXTH, typename STORAGE_T, typename COMPUTE_T>
+template <int BDIM_X, int ELXTH, int PSCALE, typename STORAGE_T, typename COMPUTE_T>
 __device__ void disco_fwd_d(const int Hi, const int Wi, const int K, const int Ho, const int Wo, const int pscale,
                             const int64_t *__restrict__ roff, const int64_t *__restrict__ kers,
                             const int64_t *__restrict__ rows, const int64_t *__restrict__ cols,
@@ -131,7 +131,12 @@ __device__ void disco_fwd_d(const int Hi, const int Wi, const int K, const int H
             //
             // with NUM_REM = BDIM_X*ELXTH - Wo
 
-            const int wpp = w + pscale * pp;
+            int wpp;
+            if constexpr (PSCALE > 0) {
+                wpp = w + PSCALE * pp;
+            } else {
+                wpp = w + pscale * pp;
+            }
 
             __reg[i] += val * static_cast<COMPUTE_T>(__sh[wpp]);
         }
@@ -149,7 +154,7 @@ __device__ void disco_fwd_d(const int Hi, const int Wi, const int K, const int H
     return;
 }
 
-template <int BDIM_X, int ELXTH, typename STORAGE_T, typename COMPUTE_T>
+template <int BDIM_X, int ELXTH, int PSCALE, typename STORAGE_T, typename COMPUTE_T>
 __global__
     __launch_bounds__(BDIM_X) void disco_fwd_blk_k(const int Hi, const int Wi, const int K, const int Ho, const int Wo,
                                                    const int pscale, const int64_t *__restrict__ roff,
@@ -158,12 +163,12 @@ __global__
                                                    const STORAGE_T *__restrict__ inp, STORAGE_T *__restrict__ out)
 {
 
-    disco_fwd_d<BDIM_X, ELXTH, STORAGE_T, COMPUTE_T>(Hi, Wi, K, Ho, Wo, pscale, roff, kers, rows, cols, vals, inp, out);
+    disco_fwd_d<BDIM_X, ELXTH, PSCALE, STORAGE_T, COMPUTE_T>(Hi, Wi, K, Ho, Wo, pscale, roff, kers, rows, cols, vals, inp, out);
 
     return;
 }
 
-template <int NTH, int ELXTH, typename STORAGE_T, typename COMPUTE_T>
+template <int NTH, int ELXTH, int PSCALE, typename STORAGE_T, typename COMPUTE_T>
 static void launch_kernel(int BC, int Hi, int Wi, int K, int Ho, int Wo, int64_t nrows, int64_t *roff_d, int64_t *ker_d,
                           int64_t *row_d, int64_t *col_d, COMPUTE_T *val_d, STORAGE_T *inp_d, STORAGE_T *out_d,
                           cudaStream_t stream)
@@ -178,15 +183,36 @@ static void launch_kernel(int BC, int Hi, int Wi, int K, int Ho, int Wo, int64_t
             const int pscale = Wi / Wo;
             size_t shmem = sizeof(*out_d) * (Wi * 2 + pscale * (NTH * ELXTH - Wo));
 
-            disco_fwd_blk_k<NTH, ELXTH, STORAGE_T, COMPUTE_T><<<grid, NTH, shmem, stream>>>(Hi, Wi, K, Ho, Wo, pscale, roff_d, ker_d, row_d,
+            disco_fwd_blk_k<NTH, ELXTH, PSCALE, STORAGE_T, COMPUTE_T><<<grid, NTH, shmem, stream>>>(Hi, Wi, K, Ho, Wo, pscale, roff_d, ker_d, row_d,
                                                                       col_d, val_d, inp_d, out_d);
         } else {
-            launch_kernel<NTH, ELXTH + 1, STORAGE_T, COMPUTE_T>(
+            launch_kernel<NTH, ELXTH + 1, PSCALE, STORAGE_T, COMPUTE_T>(
                 BC, Hi, Wi, K, Ho, Wo, nrows, roff_d, ker_d, row_d, col_d, val_d, inp_d, out_d, stream
             );
         }
     }
     return;
+}
+
+template <int NTH, int ELXTH, typename STORAGE_T, typename COMPUTE_T>
+static void launch_kernel_pscale(int BC, int Hi, int Wi, int K, int Ho, int Wo, int64_t nrows, int64_t *roff_d, int64_t *ker_d,
+                                 int64_t *row_d, int64_t *col_d, COMPUTE_T *val_d, STORAGE_T *inp_d, STORAGE_T *out_d,
+                                 cudaStream_t stream)
+{
+    const int pscale = Wi / Wo;
+    if (pscale == 1) {
+        launch_kernel<NTH, ELXTH, 1, STORAGE_T, COMPUTE_T>(
+            BC, Hi, Wi, K, Ho, Wo, nrows, roff_d, ker_d, row_d, col_d, val_d, inp_d, out_d, stream
+        );
+    } else if (pscale == 2) {
+        launch_kernel<NTH, ELXTH, 2, STORAGE_T, COMPUTE_T>(
+            BC, Hi, Wi, K, Ho, Wo, nrows, roff_d, ker_d, row_d, col_d, val_d, inp_d, out_d, stream
+        );
+    } else {
+        launch_kernel<NTH, ELXTH, 0, STORAGE_T, COMPUTE_T>(
+            BC, Hi, Wi, K, Ho, Wo, nrows, roff_d, ker_d, row_d, col_d, val_d, inp_d, out_d, stream
+        );
+    }
 }
 
     torch::Tensor disco_cuda_fwd(torch::Tensor inp, torch::Tensor roff_idx, torch::Tensor ker_idx, torch::Tensor row_idx,
@@ -216,7 +242,7 @@ static void launch_kernel(int BC, int Hi, int Wi, int K, int Ho, int Wo, int64_t
         // allocate output
         int64_t out_dims[] = {B, C, K, Ho, Wo};
         auto options = torch::TensorOptions().device(inp.device()).dtype(inp.dtype());
-        torch::Tensor out = torch::zeros(out_dims, options);
+        torch::Tensor out = torch::empty(out_dims, options);
 
         // get stream
         auto stream = at::cuda::getCurrentCUDAStream().stream();
@@ -229,7 +255,7 @@ static void launch_kernel(int BC, int Hi, int Wi, int K, int Ho, int Wo, int64_t
             AT_DISPATCH_FLOATING_TYPES(inp.scalar_type(), "disco_forward_cuda", ([&] {
                 using storage_t = scalar_t;
                 using compute_t = typename at::opmath_type<storage_t>;
-                launch_kernel<64, 1, storage_t, compute_t>(
+                launch_kernel_pscale<64, 1, storage_t, compute_t>(
                     BC, Hi, Wi, K, Ho, Wo, nrows, roff_idx.data_ptr<int64_t>(),
                     ker_idx.data_ptr<int64_t>(), row_idx.data_ptr<int64_t>(),
                     col_idx.data_ptr<int64_t>(), val.data_ptr<compute_t>(),
@@ -239,7 +265,7 @@ static void launch_kernel(int BC, int Hi, int Wi, int K, int Ho, int Wo, int64_t
             AT_DISPATCH_FLOATING_TYPES(inp.scalar_type(), "disco_forward_cuda", ([&] {
                 using storage_t = scalar_t;
                 using compute_t = typename at::opmath_type<storage_t>;
-                launch_kernel<128, (ELXTH_MAX / 2) + 1, storage_t, compute_t>(
+                launch_kernel_pscale<128, (ELXTH_MAX / 2) + 1, storage_t, compute_t>(
                     BC, Hi, Wi, K, Ho, Wo, nrows, roff_idx.data_ptr<int64_t>(),
                     ker_idx.data_ptr<int64_t>(), row_idx.data_ptr<int64_t>(),
                     col_idx.data_ptr<int64_t>(), val.data_ptr<compute_t>(),
@@ -249,7 +275,7 @@ static void launch_kernel(int BC, int Hi, int Wi, int K, int Ho, int Wo, int64_t
             AT_DISPATCH_FLOATING_TYPES(inp.scalar_type(), "disco_forward_cuda", ([&] {
                 using storage_t = scalar_t;
                 using compute_t = typename at::opmath_type<storage_t>;
-                launch_kernel<256, (ELXTH_MAX / 2) + 1, storage_t, compute_t>(
+                launch_kernel_pscale<256, (ELXTH_MAX / 2) + 1, storage_t, compute_t>(
                     BC, Hi, Wi, K, Ho, Wo, nrows, roff_idx.data_ptr<int64_t>(),
                     ker_idx.data_ptr<int64_t>(), row_idx.data_ptr<int64_t>(),
                     col_idx.data_ptr<int64_t>(), val.data_ptr<compute_t>(),
@@ -259,7 +285,7 @@ static void launch_kernel(int BC, int Hi, int Wi, int K, int Ho, int Wo, int64_t
             AT_DISPATCH_FLOATING_TYPES(inp.scalar_type(), "disco_forward_cuda", ([&] {
                 using storage_t = scalar_t;
                 using compute_t = typename at::opmath_type<storage_t>;
-                launch_kernel<512, (ELXTH_MAX / 2) + 1, storage_t, compute_t>(
+                launch_kernel_pscale<512, (ELXTH_MAX / 2) + 1, storage_t, compute_t>(
                     BC, Hi, Wi, K, Ho, Wo, nrows, roff_idx.data_ptr<int64_t>(),
                     ker_idx.data_ptr<int64_t>(), row_idx.data_ptr<int64_t>(),
                     col_idx.data_ptr<int64_t>(), val.data_ptr<compute_t>(),
@@ -269,7 +295,7 @@ static void launch_kernel(int BC, int Hi, int Wi, int K, int Ho, int Wo, int64_t
             AT_DISPATCH_FLOATING_TYPES(inp.scalar_type(), "disco_forward_cuda", ([&] {
                 using storage_t = scalar_t;
                 using compute_t = typename at::opmath_type<storage_t>;
-                launch_kernel<1024, (ELXTH_MAX / 2) + 1, storage_t, compute_t>(
+                launch_kernel_pscale<1024, (ELXTH_MAX / 2) + 1, storage_t, compute_t>(
                     BC, Hi, Wi, K, Ho, Wo, nrows, roff_idx.data_ptr<int64_t>(),
                     ker_idx.data_ptr<int64_t>(), row_idx.data_ptr<int64_t>(),
                     col_idx.data_ptr<int64_t>(), val.data_ptr<compute_t>(),
