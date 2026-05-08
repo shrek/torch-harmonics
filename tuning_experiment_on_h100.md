@@ -42,15 +42,28 @@ ELF file 2: _C.cpython-312-x86_64-linux-gnu.2.sm_90.cubin
 
 ## Trace Inputs
 
-The trace showed DISCO forward kernels dominating the GPU kernel time:
+The trace showed DISCO forward kernels dominating the GPU kernel time. The table
+below lists the dominant `cat=kernel` events, sorted by total duration. Kernel
+names are shortened for readability, and shapes come from the correlated
+CPU-side profiler event input dimensions.
 
-| Kernel | Calls | Total time |
-| --- | ---: | ---: |
-| `disco_fwd_blk_k<64, 12, float, float>` | 132 | ~5925 ms |
-| `disco_fwd_blk_k<64, 23, float, float>` | 24 | ~917 ms |
+| Rank | Kernel / CPU op | Calls | Total ms | Kernel time | Correlated shapes |
+| ---: | --- | ---: | ---: | ---: | --- |
+| 1 | `disco_fwd_blk_k<64,12>` / `disco_kernels::forward` | 132 | 5925.001 | 51.6% | DISCO inputs: `(1,677,360,720)` x96; `(1,12,721,1440)` x12; `(13,5,721,1440)` x12; `(1,7,721,1440)` x12 |
+| 2 | CUTLASS bf16 `bmm` `256x128` | 96 | 1509.935 | 13.2% | `bmm`: `[1,677,6093] x [1,6093,259200]` |
+| 3 | `disco_fwd_blk_k<64,23>` / `disco_kernels::forward` | 24 | 916.726 | 8.0% | DISCO inputs: `(13,45,721,1440)` x12; `(1,56,721,1440)` x12 |
+| 4 | float `aten::copy_` elementwise copy | 888 | 630.819 | 5.5% | Most frequent: `[5,13,721,1440,9,9,1]` x480; `[360,677,360]` x96; `[1,677,360,360]` x96 |
+| 5 | CUTLASS bf16 `cudnn_convolution` `128x128` | 120 | 439.856 | 3.8% | convolution: input `[1,677,360,720]`, weight `[1354,677,1,1]` |
+| 6 | bf16 `aten::copy_` vectorized copy | 1104 | 307.921 | 2.7% | Most frequent: `[1,1,677,9,360,720]` x384; `[1354]` x120; `[1354,677,1,1]` x120 |
+| 7 | CUTLASS bf16 `cudnn_convolution` `128x256` | 120 | 266.634 | 2.3% | convolution: input `[1,1354,360,720]`, weight `[641,1354,1,1]` |
+| 8 | float `aten::fill_` | 696 | 248.447 | 2.2% | Most frequent: `[1,677,9,360,720]` x384; `[13,45,9,721,1440]` x96 |
+| 9 | bf16 `aten::add_` elementwise add | 240 | 182.011 | 1.6% | `[1,1354,360,720] + [1,1354,1,1]` x120; `[1,641,360,720] + [1,641,1,1]` x120 |
+| 10 | complex `aten::copy_` elementwise copy | 84 | 136.058 | 1.2% | Most frequent: `[360,677,677]` x24; `[1,1,677,360,360]` x24; `[1,677,360,360]` x24 |
+| 11 | bf16 depthwise conv kernel / `aten::_conv_depthwise2d` | 120 | 125.251 | 1.1% | input `[1,641,360,720]`, weight `[641,1,1,1]` |
+| 12 | cuBLAS GEMV / `aten::bmm` | 12 | 124.034 | 1.1% | `bmm`: `[5,13497120,81] x [5,81,1]` |
 
 Combined DISCO forward time was approximately 6.84 s out of 11.48 s total GPU
-kernel time in the trace.
+kernel time in the trace, or about 59.6% of kernel time.
 
 The FCN3 trace produced the following DISCO-shaped input groups:
 
@@ -122,6 +135,54 @@ runs.
 | Forward `PSCALE` specialization | 6973.143 ms | 6169.654 ms | **803.489 ms, 11.5% faster incrementally** | Kept |
 | Dense-row `ker,row` derivation from `blockIdx.x` | 6169.654 ms | 6159.774 ms | **9.880 ms, 0.2% faster incrementally** | Kept |
 | Final combined kept changes | 7254.308 ms | 6159.774 ms | **1094.534 ms, 15.1% faster overall** | Kept |
+
+## Optimized Inference Trace Validation
+
+After the tuned extension was built and installed, a new inference trace was
+captured here:
+
+```text
+/outputs/foundry_fcn3_workflow/exec_1778205161_814d1b40/fcn3-08-07_2.trace.json.gz
+```
+
+The optimized trace confirms that the forward DISCO kernels are using the new
+compile-time specializations. For example, the trace contains:
+
+```text
+disco_fwd_blk_k<64, 12, 1, true, float, float>
+disco_fwd_blk_k<64, 12, 2, true, float, float>
+disco_fwd_blk_k<64, 23, 1, true, float, float>
+```
+
+The third template argument is the specialized `PSCALE`, and the `true` argument
+is the dense-row specialization.
+
+Trace-to-trace kernel-time comparison:
+
+| Metric | Baseline trace | Optimized trace | Net improvement |
+| --- | ---: | ---: | ---: |
+| Total GPU `cat=kernel` time | 11478.095 ms | 10295.542 ms | **1182.553 ms, 10.3% faster** |
+| DISCO forward kernel time | 6841.727 ms | 6025.787 ms | **815.940 ms, 11.9% faster** |
+| DISCO share of kernel time | 59.6% | 58.5% | **1.1 percentage points lower** |
+| Float fill kernels | 289.660 ms | 3.577 ms | **286.083 ms lower** |
+| Float copy kernels | 640.469 ms | 510.347 ms | **130.122 ms lower** |
+
+DISCO forward breakdown by correlated input shape:
+
+| Input shape | K/Ho/Wo | Baseline kernel | Optimized kernel | Calls | Baseline ms | Optimized ms | Net improvement |
+| --- | --- | --- | --- | ---: | ---: | ---: | ---: |
+| `(1, 677, 360, 720)` | `9/360/720` | `<64,12,float,float>` | `<64,12,1,true,float,float>` | 96 | 5863.185 | 5087.717 | **775.468 ms, 13.2% faster** |
+| `(13, 45, 721, 1440)` | `9/721/1440` | `<64,23,float,float>` | `<64,23,1,true,float,float>` | 12 | 828.787 | 794.610 | **34.176 ms, 4.1% faster** |
+| `(1, 56, 721, 1440)` | `9/721/1440` | `<64,23,float,float>` | `<64,23,1,true,float,float>` | 12 | 87.939 | 83.295 | **4.644 ms, 5.3% faster** |
+| `(13, 5, 721, 1440)` | `9/360/720` | `<64,12,float,float>` | `<64,12,2,true,float,float>` | 12 | 41.687 | 40.989 | **0.698 ms, 1.7% faster** |
+| `(1, 12, 721, 1440)` | `9/360/720` | `<64,12,float,float>` | `<64,12,2,true,float,float>` | 12 | 11.481 | 11.001 | **0.480 ms, 4.2% faster** |
+| `(1, 7, 721, 1440)` | `9/360/720` | `<64,12,float,float>` | `<64,12,2,true,float,float>` | 12 | 8.648 | 8.175 | **0.473 ms, 5.5% faster** |
+
+The full inference trace improvement is smaller than the focused DISCO
+microbenchmark because non-DISCO work is still present and some non-DISCO kernel
+categories are effectively unchanged. The largest real-trace improvement is the
+local high-channel DISCO case, which accounts for most DISCO time in this
+workflow.
 
 ## Strategies Tried
 
