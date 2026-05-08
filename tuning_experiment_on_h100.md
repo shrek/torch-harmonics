@@ -109,6 +109,20 @@ Baseline timing on the sm90-only H100 build before the kept kernel changes:
 | `dec_b13_c45` | 77.420 | 929.040 |
 | **Aggregate** | | **7254.308** |
 
+## Net Performance Improvements
+
+The table below attributes the measured trace-weighted aggregate improvements to
+the techniques that were kept. The attribution is incremental in the order the
+techniques were benchmarked, so small differences include benchmark noise between
+runs.
+
+| Technique | Aggregate before | Aggregate after | Net improvement | Decision |
+| --- | ---: | ---: | ---: | --- |
+| Conditional `torch::empty` allocation for dense rows | 7254.308 ms | 6973.143 ms | **281.165 ms, 3.9% faster** | Kept |
+| Forward `PSCALE` specialization | 6973.143 ms | 6169.654 ms | **803.489 ms, 11.5% faster incrementally** | Kept |
+| Dense-row `ker,row` derivation from `blockIdx.x` | 6169.654 ms | 6159.774 ms | **9.880 ms, 0.2% faster incrementally** | Kept |
+| Final combined kept changes | 7254.308 ms | 6159.774 ms | **1094.534 ms, 15.1% faster overall** | Kept |
+
 ## Strategies Tried
 
 ### 1. Confirm and Add Forward pscale Specialization
@@ -330,4 +344,3 @@ These are possible follow-up ideas that were not implemented in this session:
    arithmetic enough to offset the extra metadata reads.
 10. Benchmark fp16/bfloat16 inference paths separately if FCN3 inference can run
     at reduced precision without accuracy regressions.
-
